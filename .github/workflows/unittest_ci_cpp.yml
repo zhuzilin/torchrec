@@ -53,6 +53,7 @@ jobs:
       run: |
         conda run -n build_binary python -m pip install --pre torch --extra-index-url https://download.pytorch.org/whl/nightly/cpu
     - name: Install gcc10 and cmake
+      # use gcc10 for c++20.
       shell: bash
       run: |
         sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa
@@ -60,26 +61,20 @@ jobs:
         sudo apt install gcc-10 g++-10
         sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100
         sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-10 100
-    - name: cmake
-      shell: bash
-      run: |
         sudo apt install cmake
     - name: setup Path
       run: |
         echo /usr/local/bin >> $GITHUB_PATH
-    - name: check gcc version
+    - name: check gcc and cmake version
       shell: bash
       run: |
         gcc --version
         g++ --version
-    - name: check cmake version
-      shell: bash
-      run: |
         cmake --version
     - name: create build folder
       shell: bash
       run: |
-        mkdir -p build
+        mkdir build
     - name: run cmake
       working-directory: ./build
       shell: bash
