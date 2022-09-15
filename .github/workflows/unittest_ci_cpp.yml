@@ -1,0 +1,63 @@
+name: C++ Unit Test CI
+
+on:
+  push:
+    paths-ignore:
+      - "docs/*"
+      - "third_party/*"
+      - .gitignore
+      - "*.md"
+  pull_request:
+    paths-ignore:
+      - "docs/*"
+      - "third_party/*"
+      - .gitignore
+      - "*.md"
+
+jobs:
+  build_test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+         - os: ubuntu-latest
+    steps:
+    - name: Check ldd --version
+      run: ldd --version
+    - name: Checkout
+      uses: actions/checkout@v2
+    - name: Install g++ and cmake
+      shell: bash
+      run: |
+        sudo apt update
+        sudo apt install -y build-essential
+    - name: setup Path
+      run: |
+        echo /usr/local/bin >> $GITHUB_PATH
+    - name: check g++ version
+      shell: bash
+      run: |
+        g++ --version
+    - name: check cmake version
+      shell: bash
+      run: |
+        cmake --version
+    - name: create build folder
+      shell: bash
+      run: |
+        mkdir -p build
+    - name: run cmake
+      working-directory: ./build
+      shell: bash
+      run: |
+        cmake -DBUILD_TEST=ON ..
+    - name: run make
+      working-directory: ./build
+      shell: bash
+      run: |
+        make
+    - name: Test
+      working-directory: ./build
+      shell: bash
+      run: |
+        ctest -v .
