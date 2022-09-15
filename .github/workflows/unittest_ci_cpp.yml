@@ -52,17 +52,25 @@ jobs:
       shell: bash
       run: |
         conda run -n build_binary python -m pip install --pre torch --extra-index-url https://download.pytorch.org/whl/nightly/cpu
-    - name: Install g++ and cmake
+    - name: Install gcc10 and cmake
       shell: bash
       run: |
+        sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa
         sudo apt update
-        sudo apt install -y build-essential
+        sudo apt install gcc-10 g++-10
+        sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100
+        sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-10 100
+    - name: cmake
+      shell: bash
+      run: |
+        sudo apt install cmake
     - name: setup Path
       run: |
         echo /usr/local/bin >> $GITHUB_PATH
-    - name: check g++ version
+    - name: check gcc version
       shell: bash
       run: |
+        gcc --version
         g++ --version
     - name: check cmake version
       shell: bash
