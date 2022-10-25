@@ -2,8 +2,6 @@
 
 namespace tde::details {
 
-static constexpr std::string_view k_schema_separator = "://";
-
 IO::IO(const std::string& config) {
   auto pos = config.find(k_schema_separator);
   TORCH_CHECK(

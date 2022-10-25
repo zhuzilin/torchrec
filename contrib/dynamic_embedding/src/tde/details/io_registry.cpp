@@ -42,6 +42,14 @@ void IORegistry::RegisterPlugin(const char* filename) {
   TORCH_CHECK(push_ptr != nullptr, "cannot find IO_Push symbol");
   provider.Push = reinterpret_cast<decltype(provider.Push)>(push_ptr);
 
+  auto load_ptr = dlsym(ptr.get(), "IO_DenseLoad");
+  TORCH_CHECK(load_ptr != nullptr, "cannot find IO_DenseLoad symbol");
+  provider.DenseLoad = reinterpret_cast<decltype(provider.DenseLoad)>(load_ptr);
+
+  auto save_ptr = dlsym(ptr.get(), "IO_DenseSave");
+  TORCH_CHECK(save_ptr != nullptr, "cannot find IO_DenseSave symbol");
+  provider.DenseSave = reinterpret_cast<decltype(provider.DenseSave)>(save_ptr);
+
   Register(provider);
   dls_.emplace_back(std::move(ptr));
 }

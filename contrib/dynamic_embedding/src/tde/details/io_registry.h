@@ -45,11 +45,39 @@ struct IOPushParameter {
   void (*on_push_complete)(void* ctx);
 };
 
+struct IODenseLoadParameter {
+  const char* table_name_;
+  uint32_t num_tensors_;
+  const char* keys_;
+  const uint64_t* key_offsets_;
+  const uint64_t* tensor_offsets_;
+  void* on_complete_context_;
+  void (*on_tensor_loaded_)(
+      void* ctx,
+      uint32_t offset,
+      void* data,
+      uint32_t data_len);
+  void (*on_all_loaded_)(void* ctx);
+};
+
+struct IODenseSaveParameter {
+  const char* table_name_;
+  uint32_t num_tensors_;
+  const char* keys_;
+  const uint64_t* key_offsets_;
+  const void* data_;
+  const uint64_t* tensor_offsets_;
+  void* on_complete_context_;
+  void (*on_save_complete_)(void* ctx);
+};
+
 struct IOProvider {
   const char* type_;
   void* (*Initialize)(const char* cfg);
   void (*Pull)(void* instance, IOPullParameter cfg);
   void (*Push)(void* instance, IOPushParameter cfg);
+  void (*DenseLoad)(void* instance, IODenseLoadParameter cfg);
+  void (*DenseSave)(void* instance, IODenseSaveParameter cfg);
   void (*Finalize)(void*);
 };
 

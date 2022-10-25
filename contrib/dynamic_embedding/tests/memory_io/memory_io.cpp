@@ -46,6 +46,32 @@ struct IOPushParameter {
   void (*on_push_complete)(void* ctx);
 };
 
+struct IODenseLoadParameter {
+  const char* table_name_;
+  uint32_t num_tensors_;
+  const char* keys_;
+  const uint64_t* key_offsets_;
+  const uint64_t* tensor_offsets_;
+  void* on_complete_context_;
+  void (*on_tensor_loaded_)(
+      void* ctx,
+      uint32_t offset,
+      void* data,
+      uint32_t data_len);
+  void (*on_all_loaded_)(void* ctx);
+};
+
+struct IODenseSaveParameter {
+  const char* table_name_;
+  uint32_t num_tensors_;
+  const char* keys_;
+  const uint64_t* key_offsets_;
+  const void* data_;
+  const uint64_t* tensor_offsets_;
+  void* on_complete_context_;
+  void (*on_save_complete_)(void* ctx);
+};
+
 } // namespace tde::details
 
 using namespace tde::details;
@@ -110,6 +136,31 @@ class MemoryIO {
     param.on_push_complete(param.on_complete_context_);
   }
 
+  void DenseLoad(IODenseLoadParameter param) {
+    uint32_t num_tensors = param.num_tensors_;
+    for (uint32_t i = 0; i < num_tensors; ++i) {
+      std::string key(param.keys_ + param.key_offsets_[i], param.key_offsets_[i + 1] - param.key_offsets_[i]);
+      std::vector<uint8_t> value = dense_ps_[key];
+      if (value.size() != param.tensor_offsets_[i + 1] - param.tensor_offsets_[i]) {
+        throw "invalid length!";
+      }
+      param.on_tensor_loaded_(param.on_complete_context_, i, value.data(), value.size());
+    }
+    param.on_all_loaded_(param.on_complete_context_);
+  }
+
+  void DenseSave(IODenseSaveParameter param) {
+    uint32_t num_tensors = param.num_tensors_;
+    for (uint32_t i = 0; i < num_tensors; ++i) {
+      std::string key(param.keys_ + param.key_offsets_[i], param.key_offsets_[i + 1] - param.key_offsets_[i]);
+      dense_ps_[key] = std::vector<uint8_t>(
+          reinterpret_cast<const uint8_t*>(param.data_) + param.tensor_offsets_[i],
+          reinterpret_cast<const uint8_t*>(param.data_) + param.tensor_offsets_[i + 1]
+      );
+    }
+    param.on_save_complete_(param.on_complete_context_);
+  }
+
  private:
   std::string Key(
       const char* table_name,
@@ -124,6 +175,7 @@ class MemoryIO {
 
   std::string prefix_;
   std::unordered_map<std::string, std::vector<uint8_t>> ps_;
+  std::unordered_map<std::string, std::vector<uint8_t>> dense_ps_;
 };
 
 extern "C" {
@@ -145,4 +197,13 @@ void IO_Pull(void* instance, IOPullParameter cfg) {
 void IO_Push(void* instance, IOPushParameter cfg) {
   reinterpret_cast<MemoryIO*>(instance)->Push(cfg);
 }
+
+void IO_DenseLoad(void* instance, IODenseLoadParameter cfg) {
+  reinterpret_cast<MemoryIO*>(instance)->DenseLoad(cfg);
+}
+
+void IO_DenseSave(void* instance, IODenseSaveParameter cfg) {
+  reinterpret_cast<MemoryIO*>(instance)->DenseSave(cfg);
+} 
+
 }
