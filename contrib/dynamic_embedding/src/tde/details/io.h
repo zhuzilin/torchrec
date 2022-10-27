@@ -7,6 +7,8 @@
 
 namespace tde::details {
 
+constexpr std::string_view k_schema_separator = "://";
+
 class IO {
  public:
   explicit IO(const std::string& config);

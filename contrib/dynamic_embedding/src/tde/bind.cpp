@@ -2,6 +2,7 @@
 
 #include "tde/id_transformer.h"
 #include "tde/ps.h"
+#include "tde/dense_ps.h"
 
 namespace tde {
 TORCH_LIBRARY(tde, m) {
@@ -20,6 +21,12 @@ TORCH_LIBRARY(tde, m) {
       .def("append", &TensorList::push_back)
       .def("__len__", &TensorList::size)
       .def("__getitem__", &TensorList::operator[]);
+
+  m.class_<StringList>("StringList")
+      .def(torch::init([]() { return c10::make_intrusive<StringList>(); }))
+      .def("append", &StringList::push_back)
+      .def("__len__", &StringList::size)
+      .def("__getitem__", &StringList::operator[]);
 
   m.class_<IDTransformer>("IDTransformer")
       .def(torch::init([](int64_t num_embedding, const std::string& config) {
@@ -47,5 +54,10 @@ TORCH_LIBRARY(tde, m) {
            int64_t>())
       .def("fetch", &PS::Fetch)
       .def("evict", &PS::Evict);
+
+  m.class_<DensePS>("DensePS")
+      .def(torch::init<std::string, std::string>())
+      .def("load", &DensePS::Load)
+      .def("save", &DensePS::Save);
 }
 } // namespace tde

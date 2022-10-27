@@ -3,15 +3,17 @@ import threading
 from typing import Dict, List, Union
 
 import torch
+import torch.nn as nn
 from torch.utils.data._utils import MP_STATUS_CHECK_INTERVAL
 from torchrec import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from .dense_ps import DensePS
 from .id_transformer_group import IDTransformerGroup
 
 
-__all__ = ["wrap", "save"]
+__all__ = ["wrap", "save", "save_dense", "load_dense"]
 
 
 # Similar to torch.utils.data._utils.pin_memory._pin_memory_loop
@@ -194,6 +196,14 @@ def wrap(
     paths = list(configs_dict.keys())
     # Attach the id transformer group to module for saving.
     module._id_transformer_group = id_transformer_group
+    module._tde_paths = paths
+
+    dense_table_name = "_tde_dense"
+    if isinstance(url, str):
+        dense_table_config = url
+    else:
+        dense_table_config = url("", dense_table_name)
+    module._dense_ps = DensePS(dense_table_name, dense_table_config)
 
     return (
         DataLoader(
@@ -207,17 +217,56 @@ def wrap(
     )
 
 
+def _raise_if_not_dynamic_embedding(module):
+    if not hasattr(module, "_id_transformer_group"):
+        raise ValueError(
+            "No _id_transformer_group property for module, is this a module with dynamic embedding?"
+        )
+    if not isinstance(module._id_transformer_group, IDTransformerGroup):
+        raise ValueError(
+            "module._id_transformer_group property is not IDTransformerGroup, is this a module with dynamic embedding?"
+        )
+
+
+def _get_dense_parameters(module: nn.Module, tde_paths: List[str], prefix=""):
+    keys = []
+    tensors = []
+    for param_name, param in module.named_parameters(prefix=prefix, recurse=False):
+        keys.append(param_name)
+        tensors.append(param)
+    for buffer_name, buffer in module.named_buffers(prefix=prefix, recurse=False):
+        keys.append(buffer_name)
+        tensors.append(buffer)
+
+    for name, child in module.named_children():
+        if prefix != "":
+            name = f"{prefix}.{name}"
+        # module is a dynamic embedding
+        if name in tde_paths:
+            continue
+        child_keys, child_tensors = _get_dense_parameters(child, tde_paths, name)
+        keys += child_keys
+        tensors += child_tensors
+    return keys, tensors
+
+
+def load_dense(module: DistributedModelParallel):
+    _raise_if_not_dynamic_embedding(module)
+    keys, tensors = _get_dense_parameters(module.module, module._tde_paths, "")
+    module._dense_ps.load(keys, tensors)
+
+
+def save_dense(module: DistributedModelParallel):
+    _raise_if_not_dynamic_embedding(module)
+    keys, tensors = _get_dense_parameters(module.module, module._tde_paths, "")
+    module._dense_ps.save(keys, tensors)
+
+
 def save(module: DistributedModelParallel):
     """
     Save the dynamic embedding part of the model.
     """
-    if not hasattr(module, "_id_transformer_group"):
-        raise ValueError(
-            "No _id_transformer_group property for module, is this a module with dynamic embeding?"
-        )
-    if not isinstance(module._id_transformer_group, IDTransformerGroup):
-        raise ValueError(
-            "module._id_transformer_group property is not IDTransformerGroup, is this a module with dynamic embeding?"
-        )
+    _raise_if_not_dynamic_embedding(module)
 
     module._id_transformer_group.save()
+    save_dense(module)
