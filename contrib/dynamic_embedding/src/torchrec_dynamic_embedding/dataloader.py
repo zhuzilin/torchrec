@@ -36,6 +36,9 @@ def transform_loop(dataloader, transform_fn, out_queue, done_event):
         # save memory
         del transformed_data
 
+    if not done_event.is_set():
+        done_event.set()
+
 
 class DataLoaderIter:
     def __init__(self, dataloader, transform_fn, num_prefetch=0):
@@ -57,6 +60,8 @@ class DataLoaderIter:
         self._done_event.set()
 
     def _get_data(self):
+        if self._done_event.is_set():
+            raise StopIteration
         if not self._transform_thread.is_alive():
             raise RuntimeError("Transform thread exited unexpectedly")
         data, handles = self._data_queue.get()
