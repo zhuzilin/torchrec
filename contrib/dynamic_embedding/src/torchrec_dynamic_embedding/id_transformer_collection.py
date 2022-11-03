@@ -1,8 +1,15 @@
 from typing import List, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torchrec import EmbeddingBagConfig, EmbeddingConfig, KeyedJaggedTensor
 
+from .distributed import (
+    broadcast_ids_to_evict,
+    broadcast_transform_result,
+    gather_global_ids,
+    scatter_cache_ids,
+)
 from .id_transformer import IDTransformer, TensorList
 from .ps import PSCollection
 
@@ -46,18 +53,25 @@ class IDTransformerCollection:
             for feature_name in config.feature_names:
                 if feature_name in feature_names:
                     raise ValueError(f"Shared feature not allowed yet.")
-            self._transformers.append(
-                IDTransformer(
+            # only rank 0 will have the id transformer
+            # and other ranks will gather their to rank 0.
+            if dist.get_rank() == 0:
+                transformer = IDTransformer(
                     num_embedding=config.num_embeddings,
                     eviction_config=eviction_config,
                     transform_config=transform_config,
                 )
-            )
+            else:
+                transformer = None
+            self._transformers.append(transformer)
         self._feature_names: List[List[str]] = [
             config.feature_names for config in tables
         ]
         self._ever_evicted = False
         self._time = 0
+
+        if dist.get_world_size() > 1:
+            self._pg = dist.new_group(backend="gloo")
 
     def transform(
         self, global_features: KeyedJaggedTensor
@@ -92,46 +106,124 @@ class IDTransformerCollection:
                 for idx in feature_indices
             ]
 
-            result = transformer.transform(
-                TensorList(global_ids), TensorList(cache_ids), self._time
-            )
-            if self._ps_collection is not None:
-                table_name = self._table_names[i]
-                ps = self._ps_collection[table_name]
-                if result.ids_to_fetch.numel() > 0:
-                    handle = ps.fetch(
-                        result.ids_to_fetch,
-                        self._time,
-                        self._ever_evicted,
-                        self._configs[i].get_weight_init_min(),
-                        self._configs[i].get_weight_init_max(),
-                    )
-                    fetch_handles.append(handle)
-                if not result.success:
-                    # TODO(zilinzhu): make this configurable
-                    ids_to_evict = transformer.evict(transformer._num_embedding // 2)
-                    ps.evict(ids_to_evict)
-                    self._ever_evicted = True
-
-                    # retry after eviction.
+            if dist.get_world_size() > 1:
+                concat_global_ids, concat_numel_list = gather_global_ids(
+                    global_ids, self._pg
+                )
+                if dist.get_rank() == 0:
+                    global_ids = global_ids + concat_global_ids[1:]
+                    cache_ids = cache_ids + [
+                        torch.empty_like(tensor) for tensor in concat_global_ids[1:]
+                    ]
+                    assert len(global_ids) == len(cache_ids)
+                    # broadcast result
                     result = transformer.transform(
                         TensorList(global_ids), TensorList(cache_ids), self._time
                     )
-                    if not result.success:
-                        raise RuntimeError(
-                            "Failed to transform global ids after eviction. "
-                            f"Maybe the num_embedding of table {table_name} is too small?"
+                else:
+                    result = None
+                success, ids_to_fetch = broadcast_transform_result(result, self._pg)
+
+                if self._ps_collection is not None:
+                    table_name = self._table_names[i]
+                    ps = self._ps_collection[table_name]
+                    if ids_to_fetch.numel() > 0:
+                        handle = ps.fetch(
+                            ids_to_fetch,
+                            self._time,
+                            self._ever_evicted,
+                            self._configs[i].get_weight_init_min(),
+                            self._configs[i].get_weight_init_max(),
                         )
-                    if result.ids_to_fetch is not None:
-                        fetch_handles.append(
-                            ps.fetch(
-                                result.ids_to_fetch,
-                                self._time,
-                                self._ever_evicted,
-                                self._configs[i].get_weight_init_min(),
-                                self._configs[i].get_weight_init_max(),
+                        fetch_handles.append(handle)
+                    if not success:
+                        # TODO(zilinzhu): make this configurable
+                        # broadcast ids_to_evict
+                        if dist.get_rank() == 0:
+                            ids_to_evict = transformer.evict(
+                                transformer._num_embedding // 2
                             )
+                        else:
+                            ids_to_evict = None
+                        ids_to_evict = broadcast_ids_to_evict(ids_to_evict, self._pg)
+
+                        ps.evict(ids_to_evict)
+                        self._ever_evicted = True
+
+                        # retry after eviction.
+                        # broadcast result
+                        if dist.get_rank() == 0:
+                            result = transformer.transform(
+                                TensorList(global_ids),
+                                TensorList(cache_ids),
+                                self._time,
+                            )
+                        else:
+                            result = None
+                        success, ids_to_fetch = broadcast_transform_result(
+                            result, self._pg
                         )
+
+                        if not success:
+                            raise RuntimeError(
+                                "Failed to transform global ids after eviction. "
+                                f"Maybe the num_embedding of table {table_name} is too small?"
+                            )
+                        if ids_to_fetch.numel() > 0:
+                            fetch_handles.append(
+                                ps.fetch(
+                                    ids_to_fetch,
+                                    self._time,
+                                    self._ever_evicted,
+                                    self._configs[i].get_weight_init_min(),
+                                    self._configs[i].get_weight_init_max(),
+                                )
+                            )
+
+                scatter_cache_ids(cache_ids, concat_numel_list, self._pg)
+            else:
+                result = transformer.transform(
+                    TensorList(global_ids), TensorList(cache_ids), self._time
+                )
+                if self._ps_collection is not None:
+                    table_name = self._table_names[i]
+                    ps = self._ps_collection[table_name]
+                    if result.ids_to_fetch.numel() > 0:
+                        handle = ps.fetch(
+                            result.ids_to_fetch,
+                            self._time,
+                            self._ever_evicted,
+                            self._configs[i].get_weight_init_min(),
+                            self._configs[i].get_weight_init_max(),
+                        )
+                        fetch_handles.append(handle)
+                    if not result.success:
+                        # TODO(zilinzhu): make this configurable
+                        ids_to_evict = transformer.evict(
+                            transformer._num_embedding // 2
+                        )
+                        ps.evict(ids_to_evict)
+                        self._ever_evicted = True
+
+                        # retry after eviction.
+                        result = transformer.transform(
+                            TensorList(global_ids), TensorList(cache_ids), self._time
+                        )
+                        if not result.success:
+                            raise RuntimeError(
+                                "Failed to transform global ids after eviction. "
+                                f"Maybe the num_embedding of table {table_name} is too small?"
+                            )
+                        if result.ids_to_fetch is not None:
+                            fetch_handles.append(
+                                ps.fetch(
+                                    result.ids_to_fetch,
+                                    self._time,
+                                    self._ever_evicted,
+                                    self._configs[i].get_weight_init_min(),
+                                    self._configs[i].get_weight_init_max(),
+                                )
+                            )
 
         cache_values = KeyedJaggedTensor(
             keys=global_features.keys(),
@@ -147,5 +239,18 @@ class IDTransformerCollection:
             return
         for i, transformer in enumerate(self._transformers):
             table_name = self._table_names[i]
-            ids = transformer.save()
+            if dist.get_world_size() > 0:
+                if dist.get_rank() == 0:
+                    ids = transformer.save()
+                    numel = torch.tensor(ids.numel())
+                    dist.broadcast(numel, src=0, group=self._pg)
+                    dist.broadcast(ids, src=0, group=self._pg)
+                else:
+                    numel = torch.tensor(0)
+                    dist.broadcast(numel, src=0, group=self._pg)
+                    ids = torch.empty((numel // 2, 2), dtype=torch.int64)
+                    dist.broadcast(ids, src=0, group=self._pg)
+            else:
+                ids = transformer.save()
+
             self._ps_collection[table_name].evict(ids)
