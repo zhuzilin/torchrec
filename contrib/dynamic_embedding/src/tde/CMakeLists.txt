@@ -1,6 +1,7 @@
 # tde_cpp_objs section, used by both unittests and tde_cpp.so
 add_library(tde_cpp_objs OBJECT id_transformer.cpp ps.cpp dense_ps.cpp
         details/naive_id_transformer.cpp
+        details/multithreaded_id_transformer.cpp
         details/cacheline_id_transformer.cpp
         details/io.cpp details/io_registry.cpp
         details/move_only_function.cpp
@@ -12,7 +13,7 @@ target_include_directories(tde_cpp_objs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../)
 target_link_libraries(tde_cpp_objs PUBLIC ${TORCH_LIBRARIES})
 target_include_directories(tde_cpp_objs PUBLIC ${TORCH_INCLUDE_DIRS})
 target_compile_features(tde_cpp_objs PUBLIC cxx_std_17)
-target_link_libraries(tde_cpp_objs PUBLIC tcb::span nlohmann_json hiredis::hiredis_static)
+target_link_libraries(tde_cpp_objs PUBLIC tcb::span nlohmann_json hiredis::hiredis_static libcuckoo)
 target_link_libraries(tde_cpp_objs PRIVATE foonathan::lexy::core)
 target_compile_options(tde_cpp_objs PUBLIC -fPIC)
 target_compile_definitions(tde_cpp_objs PUBLIC -DJSON_HAS_CPP_17)
@@ -39,6 +40,9 @@ if (TDE_WITH_TESTING)
     
     add_tde_test(naive_id_transformer_test details/naive_id_transformer_test.cpp)
     add_tde_benchmark(naive_id_transformer_benchmark details/naive_id_transformer_benchmark.cpp)
+
+    add_tde_test(multithreaded_id_transformer_test details/multithreaded_id_transformer_test.cpp)
+    add_tde_benchmark(multithreaded_id_transformer_benchmark details/multithreaded_id_transformer_benchmark.cpp)
 
     add_tde_test(cacheline_id_transformer_test details/cacheline_id_transformer_test.cpp)
     add_tde_benchmark(cacheline_id_transformer_benchmark details/cacheline_id_transformer_benchmark.cpp)

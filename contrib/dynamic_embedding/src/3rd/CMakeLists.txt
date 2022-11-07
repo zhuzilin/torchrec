@@ -62,3 +62,11 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(foonathan_lexy)
+
+FetchContent_Declare(
+        libcuckoo
+        GIT_REPOSITORY https://github.com/efficient/libcuckoo.git
+        GIT_TAG 735a74b01610fb8d3614019429af370856e4a88c
+)
+
+FetchContent_MakeAvailable(libcuckoo)
