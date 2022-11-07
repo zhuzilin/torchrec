@@ -1,3 +1,4 @@
+from time import time
 from typing import List, Tuple, Union
 
 import torch
@@ -115,11 +116,35 @@ class IDTransformerCollection:
                     cache_ids = cache_ids + [
                         torch.empty_like(tensor) for tensor in concat_global_ids[1:]
                     ]
-                    assert len(global_ids) == len(cache_ids)
-                    # broadcast result
-                    success, ids_to_fetch = transformer.transform(
-                        TensorList(global_ids), TensorList(cache_ids), self._time
-                    )
+
+                    total_numel = sum([tensor.numel() for tensor in global_ids])
+                    if total_numel > 3e6:
+                        all_tensor = torch.cat(global_ids).to("cuda:0")
+                        unique_all_tensor, index = torch.unique(
+                            all_tensor, return_inverse=True
+                        )
+                        unique_all_tensor = unique_all_tensor.to("cpu")
+                        all_cache = torch.empty_like(unique_all_tensor)
+                        success, ids_to_fetch = transformer.transform(
+                            TensorList([unique_all_tensor]),
+                            TensorList([all_cache]),
+                            self._time,
+                        )
+                        del all_tensor
+                        all_tensor = all_cache.to("cuda:0")[index]
+                        offset = 0
+                        for tensor in cache_ids:
+                            numel = tensor.numel()
+                            tensor.copy_(all_tensor[offset : offset + numel])
+                            offset += numel
+                        assert (
+                            total_numel == offset
+                        ), f"total_numel not equal offset, {total_numel} vs {offset}"
+                    else:
+                        # broadcast result
+                        success, ids_to_fetch = transformer.transform(
+                            TensorList(global_ids), TensorList(cache_ids), self._time
+                        )
                 else:
                     success, ids_to_fetch = True, None
                 success, ids_to_fetch = broadcast_transform_result(
@@ -184,9 +209,33 @@ class IDTransformerCollection:
 
                 scatter_cache_ids(cache_ids, concat_numel_list, self._pg)
             else:
-                success, ids_to_fetch = transformer.transform(
-                    TensorList(global_ids), TensorList(cache_ids), self._time
-                )
+                total_numel = sum([tensor.numel() for tensor in global_ids])
+                if total_numel > 3e6:
+                    all_tensor = torch.cat(global_ids).to("cuda:0")
+                    unique_all_tensor, index = torch.unique(
+                        all_tensor, return_inverse=True
+                    )
+                    unique_all_tensor = unique_all_tensor.to("cpu")
+                    all_cache = torch.empty_like(unique_all_tensor)
+                    success, ids_to_fetch = transformer.transform(
+                        TensorList([unique_all_tensor]),
+                        TensorList([all_cache]),
+                        self._time,
+                    )
+                    del all_tensor
+                    all_tensor = all_cache.to("cuda:0")[index]
+                    offset = 0
+                    for tensor in cache_ids:
+                        numel = tensor.numel()
+                        tensor.copy_(all_tensor[offset : offset + numel])
+                        offset += numel
+                    assert (
+                        total_numel == offset
+                    ), f"total_numel not equal offset, {total_numel} vs {offset}"
+                else:
+                    success, ids_to_fetch = transformer.transform(
+                        TensorList(global_ids), TensorList(cache_ids), self._time
+                    )
                 if self._ps_collection is not None:
                     table_name = self._table_names[i]
                     ps = self._ps_collection[table_name]
