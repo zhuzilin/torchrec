@@ -117,12 +117,14 @@ class IDTransformerCollection:
                     ]
                     assert len(global_ids) == len(cache_ids)
                     # broadcast result
-                    result = transformer.transform(
+                    success, ids_to_fetch = transformer.transform(
                         TensorList(global_ids), TensorList(cache_ids), self._time
                     )
                 else:
-                    result = None
-                success, ids_to_fetch = broadcast_transform_result(result, self._pg)
+                    success, ids_to_fetch = True, None
+                success, ids_to_fetch = broadcast_transform_result(
+                    success, ids_to_fetch, self._pg
+                )
 
                 if self._ps_collection is not None:
                     table_name = self._table_names[i]
@@ -153,15 +155,15 @@ class IDTransformerCollection:
                         # retry after eviction.
                         # broadcast result
                         if dist.get_rank() == 0:
-                            result = transformer.transform(
+                            success, ids_to_fetch = transformer.transform(
                                 TensorList(global_ids),
                                 TensorList(cache_ids),
                                 self._time,
                             )
                         else:
-                            result = None
+                            success, ids_to_fetch = True, None
                         success, ids_to_fetch = broadcast_transform_result(
-                            result, self._pg
+                            success, ids_to_fetch, self._pg
                         )
 
                         if not success:
@@ -182,22 +184,22 @@ class IDTransformerCollection:
 
                 scatter_cache_ids(cache_ids, concat_numel_list, self._pg)
             else:
-                result = transformer.transform(
+                success, ids_to_fetch = transformer.transform(
                     TensorList(global_ids), TensorList(cache_ids), self._time
                 )
                 if self._ps_collection is not None:
                     table_name = self._table_names[i]
                     ps = self._ps_collection[table_name]
-                    if result.ids_to_fetch.numel() > 0:
+                    if ids_to_fetch.numel() > 0:
                         handle = ps.fetch(
-                            result.ids_to_fetch,
+                            ids_to_fetch,
                             self._time,
                             self._ever_evicted,
                             self._configs[i].get_weight_init_min(),
                             self._configs[i].get_weight_init_max(),
                         )
                         fetch_handles.append(handle)
-                    if not result.success:
+                    if not success:
                         # TODO(zilinzhu): make this configurable
                         ids_to_evict = transformer.evict(
                             transformer._num_embedding // 2
@@ -206,18 +208,18 @@ class IDTransformerCollection:
                         self._ever_evicted = True
 
                         # retry after eviction.
-                        result = transformer.transform(
+                        success, ids_to_fetch = transformer.transform(
                             TensorList(global_ids), TensorList(cache_ids), self._time
                         )
-                        if not result.success:
+                        if not success:
                             raise RuntimeError(
                                 "Failed to transform global ids after eviction. "
                                 f"Maybe the num_embedding of table {table_name} is too small?"
                             )
-                        if result.ids_to_fetch is not None:
+                        if ids_to_fetch is not None:
                             fetch_handles.append(
                                 ps.fetch(
-                                    result.ids_to_fetch,
+                                    ids_to_fetch,
                                     self._time,
                                     self._ever_evicted,
                                     self._configs[i].get_weight_init_min(),
@@ -239,7 +241,7 @@ class IDTransformerCollection:
             return
         for i, transformer in enumerate(self._transformers):
             table_name = self._table_names[i]
-            if dist.get_world_size() > 0:
+            if dist.get_world_size() > 1:
                 if dist.get_rank() == 0:
                     ids = transformer.save()
                     numel = torch.tensor(ids.numel())

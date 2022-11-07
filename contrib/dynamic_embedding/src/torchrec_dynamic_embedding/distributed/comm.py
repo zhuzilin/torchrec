@@ -56,12 +56,12 @@ def scatter_cache_ids(
             offset += cache_ids.numel()
 
 
-def broadcast_transform_result(result, group):
+def broadcast_transform_result(
+    success: bool, ids_to_fetch: Optional[torch.Tensor], group
+):
     if dist.get_rank() == 0:
-        success = result.success
-        ids_to_fetch = result.ids_to_fetch
         success_and_numel = torch.tensor(
-            [1 if result.success else 0, ids_to_fetch.numel()], dtype=torch.int64
+            [1 if success else 0, ids_to_fetch.numel()], dtype=torch.int64
         )
         dist.broadcast(success_and_numel, src=0, group=group)
     else:
