@@ -75,6 +75,40 @@ class IDTransformerCollection:
             self._pg = dist.new_group(backend="gloo")
         self._stream = torch.cuda.Stream()
 
+    def _transform(
+        self, transformer, global_ids: List[torch.Tensor], cache_ids: List[torch.Tensor]
+    ):
+        with torch.cuda.stream(self._stream):
+            total_numel = sum([tensor.numel() for tensor in global_ids])
+            if total_numel > 1e6:
+                all_tensor = torch.cat(global_ids).to("cuda:0")
+                unique_all_tensor, index = torch.unique(all_tensor, return_inverse=True)
+                unique_all_tensor = unique_all_tensor.to("cpu")
+                all_cache = torch.empty_like(unique_all_tensor)
+                success, ids_to_fetch = transformer.transform(
+                    TensorList([unique_all_tensor]),
+                    TensorList([all_cache]),
+                    self._time,
+                )
+                del all_tensor
+                all_tensor = torch.take(all_cache.to("cuda:0"), index)
+                offset = 0
+                for tensor in cache_ids:
+                    numel = tensor.numel()
+                    tensor.copy_(all_tensor[offset : offset + numel])
+                    offset += numel
+                assert (
+                    total_numel == offset
+                ), f"total_numel not equal offset, {total_numel} vs {offset}"
+            else:
+                # broadcast result
+                success, ids_to_fetch = transformer.transform(
+                    TensorList(global_ids),
+                    TensorList(cache_ids),
+                    self._time,
+                )
+            return success, ids_to_fetch
+
     def transform(
         self, global_features: KeyedJaggedTensor
     ) -> Tuple[KeyedJaggedTensor, List[torch.classes.tde.FetchHandle]]:
@@ -85,207 +119,150 @@ class IDTransformerCollection:
             KeyedJaggedTensor: the transformed kjt.
             List[torch.classes.tde.FetchHandle]: list of fetch handles to wait.
         """
-        with torch.cuda.stream(self._stream):
-            global_values = global_features.values()
-            cache_values = torch.empty_like(global_values)
+        global_values = global_features.values()
+        cache_values = torch.empty_like(global_values)
 
-            global_feature_indices = {
-                feature_name: i for i, feature_name in enumerate(global_features.keys())
-            }
-            offset_per_key = global_features.offset_per_key()
+        global_feature_indices = {
+            feature_name: i for i, feature_name in enumerate(global_features.keys())
+        }
+        offset_per_key = global_features.offset_per_key()
 
-            fetch_handles = []
-            for i, transformer in enumerate(self._transformers):
-                feature_names = self._feature_names[i]
-                feature_indices = [
-                    global_feature_indices[feature_name]
-                    for feature_name in feature_names
-                ]
-                global_ids = [
-                    global_values[offset_per_key[idx] : offset_per_key[idx + 1]]
-                    for idx in feature_indices
-                ]
-                cache_ids = [
-                    cache_values[offset_per_key[idx] : offset_per_key[idx + 1]]
-                    for idx in feature_indices
-                ]
+        fetch_handles = []
+        for i, transformer in enumerate(self._transformers):
+            feature_names = self._feature_names[i]
+            feature_indices = [
+                global_feature_indices[feature_name] for feature_name in feature_names
+            ]
+            global_ids = [
+                global_values[offset_per_key[idx] : offset_per_key[idx + 1]]
+                for idx in feature_indices
+            ]
+            cache_ids = [
+                cache_values[offset_per_key[idx] : offset_per_key[idx + 1]]
+                for idx in feature_indices
+            ]
 
-                if dist.get_world_size() > 1:
-                    concat_global_ids, concat_numel_list = gather_global_ids(
-                        global_ids, self._pg
+            if dist.get_world_size() > 1:
+                concat_global_ids, concat_numel_list = gather_global_ids(
+                    global_ids, self._pg
+                )
+                if dist.get_rank() == 0:
+                    global_ids = global_ids + concat_global_ids[1:]
+                    cache_ids = cache_ids + [
+                        torch.empty_like(tensor) for tensor in concat_global_ids[1:]
+                    ]
+
+                    success, ids_to_fetch = self._transform(
+                        transformer, global_ids, cache_ids
                     )
-                    if dist.get_rank() == 0:
-                        global_ids = global_ids + concat_global_ids[1:]
-                        cache_ids = cache_ids + [
-                            torch.empty_like(tensor) for tensor in concat_global_ids[1:]
-                        ]
-
-                        total_numel = sum([tensor.numel() for tensor in global_ids])
-                        if total_numel > 1e6:
-                            all_tensor = torch.cat(global_ids).to("cuda:0")
-                            unique_all_tensor, index = torch.unique(
-                                all_tensor, return_inverse=True
-                            )
-                            unique_all_tensor = unique_all_tensor.to("cpu")
-                            all_cache = torch.empty_like(unique_all_tensor)
-                            success, ids_to_fetch = transformer.transform(
-                                TensorList([unique_all_tensor]),
-                                TensorList([all_cache]),
-                                self._time,
-                            )
-                            del all_tensor
-                            all_tensor = torch.take(all_cache.to("cuda:0"), index)
-                            offset = 0
-                            for tensor in cache_ids:
-                                numel = tensor.numel()
-                                tensor.copy_(all_tensor[offset : offset + numel])
-                                offset += numel
-                            assert (
-                                total_numel == offset
-                            ), f"total_numel not equal offset, {total_numel} vs {offset}"
-                        else:
-                            # broadcast result
-                            success, ids_to_fetch = transformer.transform(
-                                TensorList(global_ids),
-                                TensorList(cache_ids),
-                                self._time,
-                            )
-                        success, ids_to_fetch = broadcast_transform_result(
-                            success, ids_to_fetch, self._pg
-                        )
-                    else:
-                        success, ids_to_fetch = broadcast_transform_result(
-                            True, None, self._pg
-                        )
-
-                    if self._ps_collection is not None:
-                        table_name = self._table_names[i]
-                        ps = self._ps_collection[table_name]
-                        if ids_to_fetch.numel() > 0:
-                            handle = ps.fetch(
-                                ids_to_fetch,
-                                self._time,
-                                self._ever_evicted,
-                                self._configs[i].get_weight_init_min(),
-                                self._configs[i].get_weight_init_max(),
-                            )
-                            fetch_handles.append(handle)
-                        if not success:
-                            # TODO(zilinzhu): make this configurable
-                            # broadcast ids_to_evict
-                            if dist.get_rank() == 0:
-                                ids_to_evict = transformer.evict(
-                                    transformer._num_embedding // 2
-                                )
-                            else:
-                                ids_to_evict = None
-                            ids_to_evict = broadcast_ids_to_evict(
-                                ids_to_evict, self._pg
-                            )
-
-                            ps.evict(ids_to_evict)
-                            self._ever_evicted = True
-
-                            # retry after eviction.
-                            # broadcast result
-                            if dist.get_rank() == 0:
-                                success, ids_to_fetch = transformer.transform(
-                                    TensorList(global_ids),
-                                    TensorList(cache_ids),
-                                    self._time,
-                                )
-                            else:
-                                success, ids_to_fetch = True, None
-                            success, ids_to_fetch = broadcast_transform_result(
-                                success, ids_to_fetch, self._pg
-                            )
-
-                            if not success:
-                                raise RuntimeError(
-                                    "Failed to transform global ids after eviction. "
-                                    f"Maybe the num_embedding of table {table_name} is too small?"
-                                )
-                            if ids_to_fetch.numel() > 0:
-                                fetch_handles.append(
-                                    ps.fetch(
-                                        ids_to_fetch,
-                                        self._time,
-                                        self._ever_evicted,
-                                        self._configs[i].get_weight_init_min(),
-                                        self._configs[i].get_weight_init_max(),
-                                    )
-                                )
-
-                    scatter_cache_ids(cache_ids, concat_numel_list, self._pg)
                 else:
-                    total_numel = sum([tensor.numel() for tensor in global_ids])
-                    if total_numel > 1e6:
-                        all_tensor = torch.cat(global_ids).to("cuda:0")
-                        unique_all_tensor, index = torch.unique(
-                            all_tensor, return_inverse=True
-                        )
-                        unique_all_tensor = unique_all_tensor.to("cpu")
-                        all_cache = torch.empty_like(unique_all_tensor)
-                        success, ids_to_fetch = transformer.transform(
-                            TensorList([unique_all_tensor]),
-                            TensorList([all_cache]),
+                    success, ids_to_fetch = True, None
+                success, ids_to_fetch = broadcast_transform_result(
+                    success, ids_to_fetch, self._pg
+                )
+
+                if self._ps_collection is not None:
+                    table_name = self._table_names[i]
+                    ps = self._ps_collection[table_name]
+                    if ids_to_fetch.numel() > 0:
+                        handle = ps.fetch(
+                            ids_to_fetch,
                             self._time,
+                            self._ever_evicted,
+                            self._configs[i].get_weight_init_min(),
+                            self._configs[i].get_weight_init_max(),
                         )
-                        del all_tensor
-                        all_tensor = torch.take(all_cache.to("cuda:0"), index)
-                        offset = 0
-                        for tensor in cache_ids:
-                            numel = tensor.numel()
-                            tensor.copy_(all_tensor[offset : offset + numel])
-                            offset += numel
-                        assert (
-                            total_numel == offset
-                        ), f"total_numel not equal offset, {total_numel} vs {offset}"
-                    else:
-                        success, ids_to_fetch = transformer.transform(
-                            TensorList(global_ids), TensorList(cache_ids), self._time
-                        )
-                    if self._ps_collection is not None:
-                        table_name = self._table_names[i]
-                        ps = self._ps_collection[table_name]
-                        if ids_to_fetch.numel() > 0:
-                            handle = ps.fetch(
-                                ids_to_fetch,
-                                self._time,
-                                self._ever_evicted,
-                                self._configs[i].get_weight_init_min(),
-                                self._configs[i].get_weight_init_max(),
-                            )
-                            fetch_handles.append(handle)
-                        if not success:
-                            # TODO(zilinzhu): make this configurable
+                        fetch_handles.append(handle)
+                    if not success:
+                        # TODO(zilinzhu): make this configurable
+                        # broadcast ids_to_evict
+                        if dist.get_rank() == 0:
                             ids_to_evict = transformer.evict(
                                 transformer._num_embedding // 2
                             )
-                            ps.evict(ids_to_evict)
-                            self._ever_evicted = True
+                        else:
+                            ids_to_evict = None
+                        ids_to_evict = broadcast_ids_to_evict(ids_to_evict, self._pg)
 
-                            # retry after eviction.
+                        ps.evict(ids_to_evict)
+                        self._ever_evicted = True
+
+                        # retry after eviction.
+                        # broadcast result
+                        if dist.get_rank() == 0:
                             success, ids_to_fetch = transformer.transform(
                                 TensorList(global_ids),
                                 TensorList(cache_ids),
                                 self._time,
                             )
-                            if not success:
-                                raise RuntimeError(
-                                    "Failed to transform global ids after eviction. "
-                                    f"Maybe the num_embedding of table {table_name} is too small?"
+                        else:
+                            success, ids_to_fetch = True, None
+                        success, ids_to_fetch = broadcast_transform_result(
+                            success, ids_to_fetch, self._pg
+                        )
+
+                        if not success:
+                            raise RuntimeError(
+                                "Failed to transform global ids after eviction. "
+                                f"Maybe the num_embedding of table {table_name} is too small?"
+                            )
+                        if ids_to_fetch.numel() > 0:
+                            fetch_handles.append(
+                                ps.fetch(
+                                    ids_to_fetch,
+                                    self._time,
+                                    self._ever_evicted,
+                                    self._configs[i].get_weight_init_min(),
+                                    self._configs[i].get_weight_init_max(),
                                 )
-                            if ids_to_fetch is not None:
-                                fetch_handles.append(
-                                    ps.fetch(
-                                        ids_to_fetch,
-                                        self._time,
-                                        self._ever_evicted,
-                                        self._configs[i].get_weight_init_min(),
-                                        self._configs[i].get_weight_init_max(),
-                                    )
+                            )
+
+                scatter_cache_ids(cache_ids, concat_numel_list, self._pg)
+            else:
+                success, ids_to_fetch = self._transform(
+                    transformer, global_ids, cache_ids
+                )
+                if self._ps_collection is not None:
+                    table_name = self._table_names[i]
+                    ps = self._ps_collection[table_name]
+                    if ids_to_fetch.numel() > 0:
+                        handle = ps.fetch(
+                            ids_to_fetch,
+                            self._time,
+                            self._ever_evicted,
+                            self._configs[i].get_weight_init_min(),
+                            self._configs[i].get_weight_init_max(),
+                        )
+                        fetch_handles.append(handle)
+                    if not success:
+                        # TODO(zilinzhu): make this configurable
+                        ids_to_evict = transformer.evict(
+                            transformer._num_embedding // 2
+                        )
+                        ps.evict(ids_to_evict)
+                        self._ever_evicted = True
+
+                        # retry after eviction.
+                        success, ids_to_fetch = transformer.transform(
+                            TensorList(global_ids),
+                            TensorList(cache_ids),
+                            self._time,
+                        )
+                        if not success:
+                            raise RuntimeError(
+                                "Failed to transform global ids after eviction. "
+                                f"Maybe the num_embedding of table {table_name} is too small?"
+                            )
+                        if ids_to_fetch is not None:
+                            fetch_handles.append(
+                                ps.fetch(
+                                    ids_to_fetch,
+                                    self._time,
+                                    self._ever_evicted,
+                                    self._configs[i].get_weight_init_min(),
+                                    self._configs[i].get_weight_init_max(),
                                 )
+                            )
 
         cache_values = KeyedJaggedTensor(
             keys=global_features.keys(),
